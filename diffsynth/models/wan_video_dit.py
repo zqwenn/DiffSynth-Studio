@@ -5,25 +5,30 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
+from torch.distributed.pipelining import pipe_split
 try:
     import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
+    print("no flash_attn_interface")
+    FLASH_ATTN_3_AVAILABLE = False
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
+    # print("no flash_attn")
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
     from sageattention import sageattn
-    SAGE_ATTN_AVAILABLE = True
+    print("no sageattention")
+    SAGE_ATTN_AVAILABLE = False
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
-    
+import torch_npu
+print('flash_attn = ', FLASH_ATTN_2_AVAILABLE)
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -41,7 +46,10 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn.flash_attn_func(q, k, v)
+        # x = flash_attn.flash_attn_func(q, k, v)
+        head_num = q.shape[2]
+        # print("use npu_fusion_attention ")
+        x = torch_npu.npu_fusion_attention(q, k, v, head_num, "BSND", keep_prob=1.0)[0]
         x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
     elif SAGE_ATTN_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -53,6 +61,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        # print("q, k ,v shape = ", q.shape, k.shape, v.shape)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
@@ -79,8 +88,10 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     # 1d rope precompute
+    # freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
+    #                [: (dim // 2)].double() / dim))d
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                   [: (dim // 2)].double() / dim))
+                   [: (dim // 2)].float() / dim))
     freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
@@ -90,7 +101,8 @@ def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
+
+    x_out = torch.view_as_real(x_out * freqs.to(torch.complex64)).flatten(2)
     return x_out.to(x.dtype)
 
 
@@ -105,7 +117,8 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         dtype = x.dtype
-        return self.norm(x.float()).to(dtype) * self.weight
+        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+        # return self.norm(x.float()).to(dtype) * self.weight
 
 
 class SelfAttention(nn.Module):
@@ -300,11 +313,14 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
                 ):
+        # print(x.dtype, timestep.dtype, context.dtype)
+        x = x.to(torch.bfloat16)
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        if context.ndim == 4:
+            context = context.squeeze(0)
         context = self.text_embedding(context)
-        
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
@@ -348,7 +364,6 @@ class WanModel(torch.nn.Module):
     @staticmethod
     def state_dict_converter():
         return WanModelStateDictConverter()
-    
     
 class WanModelStateDictConverter:
     def __init__(self):
