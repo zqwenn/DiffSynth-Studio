@@ -61,8 +61,19 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        # print("q, k ,v shape = ", q.shape, k.shape, v.shape)
         x = F.scaled_dot_product_attention(q, k, v)
+
+        # head_num = q.shape[1]
+        # x = torch_npu.npu_fusion_attention(
+        #                     q, k, v, head_num, input_layout="BNSD", 
+        #                     pse=None,
+        #                     # atten_mask=atten_mask_npu,
+        #                     scale=1.0 / math.sqrt(q.shape[-1]),
+        #                     pre_tockens=2147483647,
+        #                     next_tockens=2147483647,
+        #                     keep_prob=1
+        #                 )[0]
+
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
 
@@ -88,8 +99,6 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     # 1d rope precompute
-    # freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-    #                [: (dim // 2)].double() / dim))d
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
                    [: (dim // 2)].float() / dim))
     freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
@@ -97,11 +106,27 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
+# https://wenote.huawei.com/wapp/pages/view/share/s/0NEGtw1OgN7G2WS9YO3PxTXF34nwew04Jx7M2k_LIO0yDu4o
+# def rope_apply(x, freqs, num_heads): # float32
+#     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+#     B, S, N, D = x.shape
+#     def rotate(x):
+#         x1, x2 = torch.chunk(x.reshape((B, S, N, D//2, 2)), 2, dim=-1)
+#         return torch.cat((-x2, x1), dim=-1).reshape((B,S,N,D))
+#     cos, sin = torch.chunk(torch.view_as_real(freqs), 2, dim=-1)
+#     cos = cos.unsqueeze(0).expand(-1,-1,-1,-1,2).flatten(-2)
+#     sin = sin.unsqueeze(0).expand(-1,-1,-1,-1,2).flatten(-2)
+#     res = x * cos + rotate(x) * sin
+#     return res.flatten(2).to(x.dtype)
+
+
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
 
+    # x_out = torch.view_as_real(x_out * freqs).flatten(2)
+#    x_out = torch.view_as_real(x_out * freqs.detach().to(torch.complex64)).flatten(2)
     x_out = torch.view_as_real(x_out * freqs.to(torch.complex64)).flatten(2)
     return x_out.to(x.dtype)
 
@@ -321,6 +346,7 @@ class WanModel(torch.nn.Module):
         if context.ndim == 4:
             context = context.squeeze(0)
         context = self.text_embedding(context)
+        
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
@@ -364,6 +390,7 @@ class WanModel(torch.nn.Module):
     @staticmethod
     def state_dict_converter():
         return WanModelStateDictConverter()
+    
     
 class WanModelStateDictConverter:
     def __init__(self):
